@@ -22,6 +22,8 @@ except ImportError:
     import urllib.request as urllib2
 
 import atexit
+import copy
+from concurrent.futures import ThreadPoolExecutor
 
 from com.vmware.vcenter.ovf_client import LibraryItem
 from pyVmomi import vim
@@ -47,27 +49,34 @@ class DeployOvfTemplate:
         self.servicemanager = None
         self.client = None
         self.helper = None
-        self.cluster_name = None
+        self.resource_pool_name = None
         self.lib_item_name = None
         self.vm_obj = None
         self.vm_name = None
+        self.vm_count = None
 
     def setup(self):
         parser = sample_cli.build_arg_parser()
         parser.add_argument('-n', '--vm_name',
                             action='store',
                             help='Name of the testing vm')
-        parser.add_argument('-clustername',
-                            '--clustername',
-                            help='The name of the cluster to be used.')
+        parser.add_argument('-resourcepoolname',
+                            '--resourcepoolname',
+                            help='The name of the resource pool to be used.')
         parser.add_argument('-libitemname',
                             '--libitemname',
                             help='The name of the library item to deploy.'
                                  'The library item should contain an OVF package.')
+        parser.add_argument('-vm_count',
+                            '--vm_count',
+                            help='Number of VMs to be created. By default is 1',
+                            type=int,
+                            default=1)
         args = sample_util.process_cli_args(parser.parse_args())
         self.lib_item_name = args.libitemname
-        self.cluster_name = args.clustername
+        self.resource_pool_name = args.resourcepoolname
         self.vm_name = args.vm_name
+        self.vm_count = args.vm_count
 
         self.servicemanager = ServiceManager(args.server,
                                              args.username,
@@ -80,18 +89,19 @@ class DeployOvfTemplate:
         self.helper = ClsApiHelper(self.client, args.skipverification)
 
         # Default VM name
-        self.vm_name = 'vm-' + str(generate_random_uuid())
+        if not self.vm_name:
+            self.vm_name = 'vm-' + str(generate_random_uuid())
 
     def execute(self):
 
-        # Find the cluster's resource pool moid
-        cluster_obj = get_obj(self.servicemanager.content,
-                              [vim.ClusterComputeResource], self.cluster_name)
-        assert cluster_obj is not None
-        print("Cluster Moref: {0}".format(cluster_obj))
+        # Find the resource pool's moid
+        resource_pool_obj = get_obj(self.servicemanager.content,
+                              [vim.ResourcePool], self.resource_pool_name)
+        assert resource_pool_obj is not None
+        print("Resource Pool Moref: {0}".format(resource_pool_obj))
 
         deployment_target = LibraryItem.DeploymentTarget(
-            resource_pool_id=cluster_obj.resourcePool._GetMoId())
+            resource_pool_id=resource_pool_obj._GetMoId())
         lib_item_id = self.helper.get_item_id_by_name(self.lib_item_name)
         assert lib_item_id
         ovf_summary = self.client.ovf_lib_item_service.filter(ovf_library_item_id=lib_item_id,
@@ -151,11 +161,28 @@ class DeployOvfTemplate:
             delete_object(self.servicemanager.content, self.vm_obj)
 
 
+def run(deploy_ovf_sample):
+    try:
+        deploy_ovf_sample.execute()
+    finally:
+        deploy_ovf_sample.cleanup()
+
+
 def main():
     deploy_ovf_sample = DeployOvfTemplate()
     deploy_ovf_sample.setup()
-    deploy_ovf_sample.execute()
-    deploy_ovf_sample.cleanup()
+
+    samples = [copy.copy(deploy_ovf_sample) for _ in range(deploy_ovf_sample.vm_count)]
+    for i, sample in enumerate(samples):
+        sample.vm_name += '-' + str(i)
+
+    with ThreadPoolExecutor(20) as tpe:
+        futures = [tpe.submit(run, sample) for sample in samples]
+        for future in futures:
+            try:
+                future.result()
+            except Exception as e:
+                print(e)
 
 
 if __name__ == '__main__':
